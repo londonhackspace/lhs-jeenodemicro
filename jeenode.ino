@@ -1,7 +1,10 @@
 #include <JeeLib.h>
+#include <avr/sleep.h>
 
-static int led = 10;
-int led_status = 0;
+volatile bool adcDone;
+
+// for low-noise/-power ADC readouts, we'll use ADC completion interrupts
+ISR(ADC_vect) { adcDone = true; }
 
 /* todo:
 
@@ -14,10 +17,9 @@ https://github.com/mharizanov/Funky-Sensor/blob/master/examples/Funky_InternalTe
 
 */
 
+#define LDR 3 // ADC7
 
-static int ldrpin = 9; // ADC1
-
-typedef struct { int temp; int ldr; int ver;} PayloadTX; // 
+typedef struct { int temp; int ldr; int bat_vcc; int vcc;} PayloadTX; // 
 PayloadTX payload;
 
 ISR(WDT_vect) { Sleepy::watchdogEvent(); } // interrupt handler for JeeLabs Sleepy power saving
@@ -32,18 +34,59 @@ float coefficient=1;
 int readings[30];
 int pos=0;
 
-void setup () {
-    pinMode(led, OUTPUT);
+static byte vccRead (byte count =4) {
+  set_sleep_mode(SLEEP_MODE_ADC);
+  // use VCC as AREF and internal bandgap as input
+  ADMUX = 33;
 
-    // switch the rfm12 on
-    bitSet(DDRB, 0); 
-    bitClear(PORTB, 0);
+  bitSet(ADCSRA, ADIE);
+  while (count-- > 0) {
+    adcDone = false;
+    while (!adcDone)
+      sleep_mode();
+  }
+  bitClear(ADCSRA, ADIE);
+  // convert ADC readings to fit in one byte, i.e. 20 mV steps:
+  // 1.0V = 0, 1.8V = 40, 3.3V = 115, 5.0V = 200, 6.0V = 250
+  return (55U * 1024U) / (ADC + 1) - 50;
+}
+
+static byte bat_vccRead (byte count =4) {
+  set_sleep_mode(SLEEP_MODE_ADC);
+  ADMUX = 32;
+
+  bitSet(ADCSRA, ADIE);
+  while (count-- > 0) {
+    adcDone = false;
+    while (!adcDone)
+      sleep_mode();
+  }
+  bitClear(ADCSRA, ADIE);
+  // convert ADC readings to fit in one byte, i.e. 20 mV steps:
+  // 1.0V = 0, 1.8V = 40, 3.3V = 115, 5.0V = 200, 6.0V = 250
+  return (55U * 1024U) / (ADC + 1) - 50;
+}
+
+void setup () {
+  cli();
+  CLKPR = bit(CLKPCE);
+  CLKPR = 0; // div 1, i.e. speed up to 8 MHz
+  sei();
+
+  // switch the rfm12 on
+  bitSet(DDRB, 0); 
+  bitClear(PORTB, 0);
+
+  // need to enable the pull-up to get a voltage drop over the LDR
+  pinMode(14+LDR, INPUT);
+  digitalWrite(14+LDR, 1); // pull-up
+  analogReference(INTERNAL);
 
     // and give it a chance to wake up, not sure if needed.
     Sleepy::loseSomeTime(200);
 
     rf12_initialize(17, RF12_868MHZ, 210); // group 210, node id 17
-    rf12_easyInit(5); // ???
+//    rf12_easyInit(5); // ???
     // see http://tools.jeelabs.org/rfm12b.html
     rf12_control(0xC040); // set low-battery level to 2.2V i.s.o. 3.1V
     rf12_sleep(RF12_SLEEP);
@@ -51,36 +94,37 @@ void setup () {
     // init our payload
     payload.temp = 0;
     payload.ldr = 0;
-    payload.ver = 6; // increase ver before you compile and upload new code
-                     // so you can be sure that the version thats running is the one you want.
+    payload.bat_vcc = 0;
+    payload.vcc = 0;
                      
     PRR = bit(PRTIM1); // only keep timer 0 going
 }
 
-void loop() {
+void read_ldr(void) {
   unsigned int ldrReading;
-  digitalWrite(led, led_status);
-  if (led_status) {
-     led_status = 0;
-  } else {
-    led_status = 1;
+  
+  Sleepy::loseSomeTime(16); // Allow 10ms for the sensor to be ready
+
+  analogRead(LDR); // throw away the first reading
+  for(int i = 0; i < 10 ; i++) // take 10 more readings
+  {
+    ldrReading += analogRead(LDR); // accumulate readings
   }
+  payload.ldr = ldrReading / 10 ; // calculate the average
+}
+
+void loop() {
 
   bitClear(PRR, PRADC); // power up the ADC
   ADCSRA |= bit(ADEN); // enable the ADC
-  Sleepy::loseSomeTime(16); // Allow 10ms for the sensor to be ready
-
-
-
-  analogRead(ldrpin); // throw away the first reading
-  for(int i = 0; i < 10 ; i++) // take 10 more readings
-  {
-    ldrReading += analogRead(ldrpin); // accumulate readings
-  }
-  payload.ldr = ldrReading / 10 ; // calculate the average
+  
+  read_ldr();
   
   int_sensor_init();
   payload.temp = in_c() * 100; // Convert temperature to an integer, reversed at receiving end
+
+  payload.bat_vcc = bat_vccRead(); //analogRead(0) >> 2;
+  payload.vcc = vccRead();
 
 //  temptx.supplyV = readVcc(); // Get supply voltage
 
@@ -94,10 +138,8 @@ void loop() {
   rf12_sendWait(2);
   rf12_sleep(RF12_SLEEP);
 
-
   ADCSRA &= ~ bit(ADEN); // disable the ADC
   bitSet(PRR, PRADC); // power down the ADC
-
 
   Sleepy::loseSomeTime(2500);
 }
@@ -174,3 +216,4 @@ int raw() {
     return ret;
   }
 }
+
